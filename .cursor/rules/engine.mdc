@@ -1,0 +1,442 @@
+---
+description: Interactive Brokers engine guidance — Gateway setup, ib_insync API, order types, options, and recipes for this strategy
+alwaysApply: true
+---
+
+# Interactive Brokers on TradingHost
+
+You are helping a user build a multi-asset trading bot using Interactive Brokers via `ib_insync`. This file covers IB-specific knowledge — Gateway setup, the `ib_insync` API, order types, options, and recipes. See `tradinghost.mdc` for platform conventions (deployment, env vars, logging, persistence, config).
+
+## Engine Overview
+
+Interactive Brokers (IB) is a professional multi-asset broker providing access to 150+ markets in 34 countries. Through the TWS/Gateway API and the `ib_insync` Python wrapper, you get programmatic access to:
+
+- **Stocks** — US, EU, Asia, 90+ exchanges
+- **Options** — equity, index, and futures options with full chain scanning
+- **Futures** — CME, EUREX, ICE, NYMEX, etc.
+- **Forex** — 100+ currency pairs
+- **Bonds** — corporate and government
+- **Funds** — ETFs and mutual funds
+
+Key capabilities:
+- Real-time streaming market data (Level 1 and Level 2)
+- Historical data (bars, ticks, fundamental data)
+- Complex order types: bracket, OCA, trailing stop, adaptive, VWAP, TWAP
+- Portfolio and account management
+- Options analytics: greeks, implied volatility, option chains
+- Scanner: market scanners for stock screening
+- News: real-time news and analyst reports
+
+The `ib_insync` library wraps IB's native API with an async/await-friendly, Pythonic interface. It handles connection management, request throttling, and data streaming automatically.
+
+Limitations:
+- Requires IB Gateway or TWS running as a separate process — it is NOT embedded in your strategy
+- Market data subscriptions may require paid data packages depending on the exchange
+- API request rate limits: 50 messages/second for most request types
+- Paper trading account has simulated data — prices may differ from live
+- PDT rule applies to US pattern day trading accounts under $25k
+
+## Gateway Setup
+
+### CRITICAL: IB Gateway is External
+
+IB Gateway (or TWS) must run somewhere your TradingHost deployment can reach. It is **not** hosted on TradingHost. Options:
+
+1. **Your VPS or cloud instance** — run IB Gateway on a Linux/Windows VPS. Best for reliability.
+2. **Home machine** — run IB Gateway locally with port forwarding. Works but depends on your network.
+3. **Same cloud provider** — run IB Gateway on a server in the same region as your TradingHost deployment for lowest latency.
+
+### Installing IB Gateway
+
+1. Download from https://www.interactivebrokers.com/en/trading/ibgateway-stable.php
+2. Install and run it (headless mode available on Linux via `IBC` — https://github.com/IbcAlpha/IBC)
+3. Log in with your IB credentials
+4. Configure:
+   - **API Settings** → enable "Enable ActiveX and Socket Clients"
+   - **API Settings** → set "Socket port": `4001` (live) or `4002` (paper)
+   - **API Settings** → check "Allow connections from localhost" and add TradingHost deployment IP (or `0.0.0.0` with firewall)
+   - **API Settings** → uncheck "Read-Only API" if you need to trade
+5. For **paper trading**: use port `4002` — IB provides a simulated account with fake money
+
+### IBC for Headless Operation
+
+For unattended server operation, use IBC (IB Controller):
+- Auto-restarts Gateway on crash
+- Handles daily restart (IB Gateway restarts at ~midnight ET)
+- Manages 2FA (can use IBKR Mobile for second factor)
+- Config file controls all settings
+
+### Connection Code
+
+```python
+from ib_insync import IB, Stock, Option, Future, Forex, util
+import json, os
+
+DATA_DIR = os.environ.get('TRADINGHOST_DATA_DIR', '/data')
+
+with open(os.path.join(DATA_DIR, 'config.json')) as f:
+    config = json.load(f)
+
+ib = IB()
+ib.connect(
+    host=config['ib_host'],
+    port=config['ib_port'],
+    clientId=config['ib_client_id'],
+    readonly=False,
+    account=config.get('account', ''),
+)
+```
+
+### Client ID
+
+Each simultaneous API connection needs a unique `clientId` (integer). If you run multiple strategies connecting to the same Gateway, give each one a different `clientId`. If your strategy crashes and reconnects, using the same `clientId` will resume existing data subscriptions.
+
+### Connection Events
+
+```python
+def on_connected():
+    log('info', 'Connected to IB Gateway')
+
+def on_disconnected():
+    log('warn', 'Disconnected from IB Gateway')
+
+ib.connectedEvent += on_connected
+ib.disconnectedEvent += on_disconnected
+```
+
+`ib_insync` automatically reconnects on disconnect by default.
+
+## Connection Resilience
+
+### Shutdown
+
+Disconnect from IB cleanly on shutdown to free the `clientId`:
+
+```python
+ib.disconnect()
+```
+
+### Restart Reconciliation
+
+IB Gateway maintains order and position state server-side. On reconnect:
+1. Call `ib.reqAllOpenOrders()` to get open orders
+2. Call `ib.positions()` to get current positions
+3. Call `ib.accountSummary()` to get account state
+4. Reconcile with your SQLite records
+5. Resume strategy only after reconciliation
+
+Using the same `clientId` across restarts is important — IB associates data subscriptions with the client ID.
+
+## Suggestions
+
+### Handle IB Disconnects
+
+IB Gateway restarts daily around midnight ET. `ib_insync` auto-reconnects, but your strategy should handle the gap:
+
+```python
+def on_disconnected():
+    log('warn', 'IB disconnected — waiting for reconnect')
+
+def on_connected():
+    log('info', 'IB reconnected — reconciling state')
+    reconcile_positions()
+
+ib.disconnectedEvent += on_disconnected
+ib.connectedEvent += on_connected
+```
+
+### Options Chain Scanning
+
+IB provides full options chain data. Common patterns:
+- Scan for puts at a target delta for cash-secured put selling
+- Find covered calls at a target delta/DTE
+- Screen for high implied volatility for premium selling
+- Build iron condors/spreads by scanning strikes
+
+### Event-Driven vs Polling
+
+`ib_insync` supports both styles:
+- **Event-driven**: subscribe to real-time data and react to events
+- **Polling loop**: periodically query state and make decisions
+
+For most strategies, a hybrid works best: subscribe to real-time prices for fast reaction, but run a periodic loop for position management and rebalancing.
+
+## Recipes
+
+### Buy/Sell Stock
+
+```python
+contract = Stock('AAPL', 'SMART', 'USD')
+ib.qualifyContracts(contract)
+
+# Market order
+order = ib.placeOrder(contract, MarketOrder('BUY', 100))
+ib.sleep(1)  # allow fill to propagate
+log('info', 'Order placed', symbol='AAPL', status=order.orderStatus.status)
+
+# Limit order
+order = ib.placeOrder(contract, LimitOrder('BUY', 100, 150.00))
+```
+
+Always call `ib.qualifyContracts(contract)` before trading — it resolves the contract to the exact IB `conId`.
+
+### Sell a Cash-Secured Put
+
+```python
+# Find the option
+chains = ib.reqSecDefOptParams(contract.symbol, '', contract.secType, contract.conId)
+chain = next(c for c in chains if c.exchange == 'SMART')
+
+# Pick expiry ~30 DTE
+from datetime import datetime, timedelta
+target_date = datetime.now() + timedelta(days=30)
+expiry = min(chain.expirations, key=lambda x: abs(
+    datetime.strptime(x, '%Y%m%d') - target_date
+))
+
+# Pick strike ~5% below current price
+ticker = ib.reqMktData(contract)
+ib.sleep(2)
+current_price = ticker.marketPrice()
+target_strike = current_price * 0.95
+strike = min(chain.strikes, key=lambda x: abs(x - target_strike))
+
+put = Option('AAPL', expiry, strike, 'P', 'SMART')
+ib.qualifyContracts(put)
+
+order = ib.placeOrder(put, LimitOrder('SELL', 1, 2.50))
+log('info', 'Sold put', symbol='AAPL', strike=strike, expiry=expiry)
+```
+
+### Sell a Covered Call
+
+```python
+# Assumes you own 100 shares of AAPL
+call = Option('AAPL', expiry, call_strike, 'C', 'SMART')
+ib.qualifyContracts(call)
+order = ib.placeOrder(call, LimitOrder('SELL', 1, 3.00))
+```
+
+### The Wheel Strategy (Put → Assignment → Covered Call)
+
+```python
+positions = ib.positions()
+has_shares = any(
+    p.contract.symbol == symbol and p.contract.secType == 'STK' and p.position >= 100
+    for p in positions
+)
+
+if has_shares:
+    # Sell covered call
+    sell_covered_call(symbol, delta_target=0.30, dte_target=30)
+else:
+    # Sell cash-secured put
+    sell_cash_secured_put(symbol, delta_target=-0.30, dte_target=30)
+```
+
+### Get Option Chain with Greeks
+
+```python
+chains = ib.reqSecDefOptParams('AAPL', '', 'STK', contract.conId)
+chain = next(c for c in chains if c.exchange == 'SMART')
+
+# Build option contracts for a specific expiry
+options = [
+    Option('AAPL', expiry, strike, right, 'SMART')
+    for strike in chain.strikes
+    for right in ('C', 'P')
+    if strike_min <= strike <= strike_max
+]
+ib.qualifyContracts(*options)
+
+# Request market data with greeks
+tickers = ib.reqTickers(*options)
+ib.sleep(2)
+
+for ticker in tickers:
+    if ticker.modelGreeks:
+        log('info', 'Option',
+            symbol=ticker.contract.symbol,
+            strike=ticker.contract.strike,
+            right=ticker.contract.right,
+            delta=ticker.modelGreeks.delta,
+            gamma=ticker.modelGreeks.gamma,
+            theta=ticker.modelGreeks.theta,
+            iv=ticker.modelGreeks.impliedVol,
+            bid=ticker.bid,
+            ask=ticker.ask,
+        )
+```
+
+### Scan Options by Delta and DTE
+
+```python
+def find_options_by_delta(symbol, right, target_delta, target_dte):
+    """Find options closest to target delta and DTE."""
+    contract = Stock(symbol, 'SMART', 'USD')
+    ib.qualifyContracts(contract)
+
+    chains = ib.reqSecDefOptParams(symbol, '', 'STK', contract.conId)
+    chain = next(c for c in chains if c.exchange == 'SMART')
+
+    target_date = datetime.now() + timedelta(days=target_dte)
+    expiry = min(chain.expirations, key=lambda x: abs(
+        datetime.strptime(x, '%Y%m%d') - target_date
+    ))
+
+    options = [
+        Option(symbol, expiry, strike, right, 'SMART')
+        for strike in chain.strikes
+    ]
+    ib.qualifyContracts(*options)
+    tickers = ib.reqTickers(*options)
+    ib.sleep(3)
+
+    best = min(
+        (t for t in tickers if t.modelGreeks and t.modelGreeks.delta),
+        key=lambda t: abs(abs(t.modelGreeks.delta) - abs(target_delta)),
+    )
+    return best
+```
+
+### Get Account Summary
+
+```python
+account_values = ib.accountSummary()
+summary = {av.tag: av.value for av in account_values if av.currency == 'USD'}
+log('info', 'Account summary',
+    net_liquidation=summary.get('NetLiquidation'),
+    buying_power=summary.get('BuyingPower'),
+    available_funds=summary.get('AvailableFunds'),
+    maintenance_margin=summary.get('MaintMarginReq'),
+)
+```
+
+### Get Current Positions
+
+```python
+positions = ib.positions()
+for pos in positions:
+    log('info', 'Position',
+        symbol=pos.contract.symbol,
+        sec_type=pos.contract.secType,
+        quantity=pos.position,
+        avg_cost=pos.avgCost,
+    )
+```
+
+### Place a Bracket Order
+
+```python
+bracket = ib.bracketOrder(
+    action='BUY',
+    quantity=100,
+    limitPrice=150.00,
+    takeProfitPrice=165.00,
+    stopLossPrice=142.50,
+)
+for order in bracket:
+    ib.placeOrder(contract, order)
+```
+
+### Futures Contract and Rolling
+
+```python
+# Front month ES futures
+es = Future('ES', '202503', 'CME')
+ib.qualifyContracts(es)
+
+# Roll to next month
+es_next = Future('ES', '202506', 'CME')
+ib.qualifyContracts(es_next)
+
+# Close front month, open next
+ib.placeOrder(es, MarketOrder('SELL', 1))
+ib.placeOrder(es_next, MarketOrder('BUY', 1))
+```
+
+### Forex Order
+
+```python
+pair = Forex('EURUSD')
+ib.qualifyContracts(pair)
+order = ib.placeOrder(pair, MarketOrder('BUY', 25000))
+```
+
+### Historical Data for Backtesting
+
+```python
+bars = ib.reqHistoricalData(
+    contract,
+    endDateTime='',
+    durationStr='30 D',
+    barSizeSetting='1 hour',
+    whatToShow='TRADES',
+    useRTH=True,
+)
+
+import pandas as pd
+df = util.df(bars)
+# columns: date, open, high, low, close, volume, average, barCount
+```
+
+### Real-Time Streaming Bars
+
+```python
+bars = ib.reqRealTimeBars(contract, 5, 'TRADES', False)
+
+def on_bar_update(bars, hasNewBar):
+    if hasNewBar:
+        bar = bars[-1]
+        log('info', 'Bar', symbol=contract.symbol,
+            open=bar.open_, high=bar.high, low=bar.low, close=bar.close)
+
+bars.updateEvent += on_bar_update
+```
+
+## Risk Management
+
+Always advise the user on risk:
+
+- **Margin awareness** — IB provides real-time margin requirements. Check `ib.accountSummary()` for `MaintMarginReq` and `AvailableFunds`. Never use more than 50-70% of available margin.
+- **Portfolio heat** — track total portfolio delta, beta-weighted exposure. Don't let any single position exceed 5-10% of portfolio value.
+- **Options assignment risk** — short options (especially ITM puts near expiration) can be assigned. Budget cash for potential stock delivery. Monitor ITM short options as expiry approaches.
+- **Earnings blackout** — avoid holding short options through earnings unless that's your explicit strategy. IV crush can work in your favor on premium selling, but the underlying move can overwhelm it.
+- **PDT rule** — US pattern day trading accounts under $25k are limited to 3 day trades per rolling 5-day period. Check `ib.accountSummary()` for `DayTradesRemaining` on reg-T margin accounts.
+- **Daily restart** — IB Gateway restarts daily around midnight ET. Your strategy must handle this gracefully (auto-reconnect, state reconciliation).
+- **Max position sizes** — configure hard limits in `config.json`. Never exceed them regardless of signals.
+- **Diversification** — spread risk across sectors and asset classes. Don't concentrate in one name.
+- **Stop losses** — use bracket orders for automatic stop loss, or implement in your strategy loop.
+- **Kill switch** — if total loss exceeds a threshold, cancel all orders and close all positions.
+- **Account for fees** — IB charges per-share for stocks (~$0.005/share), per-contract for options (~$0.65/contract). Factor into PnL.
+
+## Testing
+
+### Paper Trading Workflow
+
+1. Set `ib_port: 4002` in `config.json` (paper trading port)
+2. Log into IB Gateway with your paper trading credentials
+3. Deploy to TradingHost — the bot trades on paper with simulated fills
+4. Verify: orders execute, positions track, disconnects are handled, shutdown is clean
+5. When satisfied, switch to `ib_port: 4001` (live) and redeploy
+
+### What Paper Trading Covers
+
+IB's paper account provides:
+- Real-time market data (same as live)
+- Simulated order execution (fills may differ from live)
+- Full portfolio tracking
+- Margin calculations
+
+### What to Verify Before Going Live
+
+- Bot starts cleanly after a restart (reconnects to Gateway, reconciles positions)
+- Daily Gateway restart (midnight ET) is handled gracefully
+- SIGTERM produces clean shutdown (IB disconnect, no orphaned orders)
+- Logging captures all trades with enough detail to audit
+- Position sizes never exceed configured maximums
+- Margin usage stays within safe bounds
+- Options assignments are handled correctly
+- The web panel shows accurate portfolio state
+- SQLite state matches IB account state after every operation
+- Error handling covers: connection refused, Gateway not running, order rejected, insufficient margin
